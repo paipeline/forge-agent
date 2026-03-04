@@ -159,10 +159,16 @@ Step 3: Forge 准备工作环境
   Forge → 为每个子任务创建 git worktree
   Forge → 创建 tmux session
 
-Step 4: PM 分配任务
-  PM Agent → 将子任务分配给可用的 worker agent
-  Forge → 启动 worker（Claude Code / Codex / OpenClaw 子会话）
-  Worker → 在各自 worktree 中执行编码
+Step 4: PM 构造 Prompt + 分配任务
+  PM Agent → 为每个子任务构造精确的 agent prompt：
+    - 系统提示词（角色、约束）
+    - 任务消息（具体指令、要创建/修改的文件）
+    - 上下文文件（PM 筛选出最相关的源码）
+    - 参考代码（PM 标注的代码片段 + 注解）
+    - 约束清单（不要做什么、注意什么）
+  PM Agent → 通过 assign_task 将 prompt 发给 Forge
+  Forge → 将 prompt 注入 worker session 并启动
+  Worker → 在各自 worktree 中按 prompt 指令执行编码
 
 Step 5: PM 监控 + 验收
   PM Agent → 实时监控每个 worker 的进度
@@ -171,7 +177,7 @@ Step 5: PM 监控 + 验收
     - 运行测试
     - 对照验收标准逐条检查
   验收通过 → 标记子任务完成
-  验收失败 → PM 分析原因，重写指令，重新分配
+  验收失败 → PM 分析原因，重写 prompt（包含错误上下文），重新分配
 
 Step 6: 汇总 + PR
   所有子任务通过 → PM 合并所有 worktree 改动
@@ -193,13 +199,22 @@ PM agent 的系统提示词定义它的角色和行为：
 
 1. **制定方案**：分析用户需求和项目代码库，制定实施方案
 2. **拆分任务**：将方案拆分为可独立执行的子任务，每个子任务有明确的验收标准
-3. **分配任务**：将子任务分配给可用的 worker agent，考虑依赖关系和并行度
-4. **监控进度**：实时监控 worker 的执行状态
-5. **验收成果**：worker 完成后，对照验收标准逐条检查
-6. **处理失败**：分析失败原因，调整方案或重写指令重试
-7. **汇总结果**：所有子任务通过后，合并改动并生成 PR
+3. **构造 Prompt**：为每个子任务构造精确的 agent prompt，包括：
+   - 系统提示词：定义 worker 的角色和工作方式
+   - 任务指令：具体要做什么、创建/修改哪些文件
+   - 上下文文件：从代码库中筛选出与该任务最相关的文件
+   - 参考代码：标注具体的代码片段，附上你的注解
+   - 约束清单：不要做什么、注意什么、遵循什么规范
+4. **分配任务**：将子任务 + prompt 发送给 Forge，由 Forge 注入 worker session
+5. **监控进度**：实时监控 worker 的执行状态
+6. **验收成果**：worker 完成后，对照验收标准逐条检查
+7. **处理失败**：分析失败原因，重写 prompt（包含错误上下文和改进指令）重试
+8. **汇总结果**：所有子任务通过后，合并改动并生成 PR
 
-你必须通过结构化的 JSON 消息与 Forge CLI 通信。
+关键：你构造的 prompt 质量直接决定 worker 的输出质量。
+你应该在扫描代码库后，利用你对项目的理解，构造出比用户自己写的更精确的 prompt。
+
+你必须通过结构化的 JSON 消息与 Forge CLI 通信（AgentPrompt 格式）。
 
 可用的 worker agent：
 {workers_config}
@@ -216,13 +231,30 @@ PM 通过结构化消息与 Forge 交互：
 // PM → Forge：请求执行动作
 type PMAction =
   | { type: 'plan_ready'; plan: Plan }
-  | { type: 'assign_task'; taskId: string; worker: string; prompt: string }
+  | { type: 'assign_task'; taskId: string; worker: string; prompt: AgentPrompt }
   | { type: 'check_worker'; taskId: string }
   | { type: 'accept_task'; taskId: string; result: 'pass' | 'fail'; reason?: string }
-  | { type: 'retry_task'; taskId: string; newPrompt: string }
+  | { type: 'retry_task'; taskId: string; prompt: AgentPrompt }  // 重写后的完整 prompt
   | { type: 'request_pr'; title: string; body: string; branches: string[] }
   | { type: 'notify'; channel: string; message: string }
   | { type: 'done'; summary: string }
+
+// PM 为每个 worker session 构造的完整 prompt
+interface AgentPrompt {
+  systemPrompt: string        // worker 的系统提示词
+  taskMessage: string         // 具体任务指令
+  contextFiles: Array<{       // PM 筛选的相关文件
+    path: string
+    reason: string
+  }>
+  codeReferences: Array<{     // PM 标注的参考代码片段
+    path: string
+    startLine: number
+    endLine: number
+    note: string
+  }>
+  constraints: string[]       // 约束和注意事项
+}
 
 // Forge → PM：反馈状态
 type ForgeEvent =

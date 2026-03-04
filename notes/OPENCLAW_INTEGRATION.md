@@ -148,10 +148,179 @@ interface SubTask {
   id: string                  // "auth-middleware"
   name: string                // "实现 JWT 中间件"
   description: string         // 详细描述
+  prompt: AgentPrompt         // ⭐ PM 为该 worker 构造的完整 prompt
   acceptance: string[]        // 验收标准列表
   dependencies: string[]      // 依赖的其他子任务 id
   complexity: 'low' | 'medium' | 'high'
   suggested_worker: string    // 建议使用的 worker 类型
+}
+```
+
+### PM 为每个 Worker 构造 Prompt
+
+PM 不只是给 worker 一段任务描述，而是为每个 agent session 构造完整的、精确的 prompt。
+PM 在扫描代码库后，掌握了项目结构、编码风格、现有实现，因此它构造的 prompt 远比用户自己写的精确。
+
+```typescript
+interface AgentPrompt {
+  // 系统提示词：定义 worker 的角色和约束
+  systemPrompt: string
+
+  // 初始消息：PM 给 worker 的具体指令
+  taskMessage: string
+
+  // 上下文文件：PM 筛选出与该子任务最相关的文件
+  contextFiles: ContextFile[]
+
+  // 约束和注意事项
+  constraints: string[]
+
+  // 参考代码：PM 从代码库中找到的相关代码片段
+  codeReferences: CodeReference[]
+}
+
+interface ContextFile {
+  path: string                // 文件路径
+  reason: string              // 为什么需要这个文件
+  sections?: string[]         // 只需关注的段落/函数名（可选）
+}
+
+interface CodeReference {
+  path: string
+  startLine: number
+  endLine: number
+  note: string                // PM 的注解："参考这个的错误处理模式"
+}
+```
+
+#### PM 构造 Prompt 的示例
+
+假设用户任务是 `"Add JWT auth with refresh token"`，PM 扫描代码库后，
+为子任务 `auth-middleware` 构造的 prompt：
+
+```json
+{
+  "systemPrompt": "你是一个专注于 Express.js 后端开发的编码 agent。你的工作目录是一个 git worktree，所有改动都在这个 worktree 中进行。完成后不要 commit，Forge 会处理。",
+
+  "taskMessage": "## 任务：实现 JWT 认证中间件\n\n在 src/middleware/ 目录下创建 auth.ts，实现 JWT token 验证中间件。\n\n### 具体要求\n1. 从 Authorization header 提取 Bearer token\n2. 使用 jsonwebtoken 库验证 token（密钥从环境变量 JWT_SECRET 读取）\n3. 验证通过后将 decoded payload 挂到 req.user\n4. 无效 token 返回 401 + { error: 'invalid_token' }\n5. 过期 token 返回 401 + { error: 'token_expired' }\n6. 缺少 token 返回 401 + { error: 'missing_token' }\n\n### 项目约定\n- 使用 TypeScript strict mode\n- 错误响应格式：{ error: string, message?: string }\n- 中间件导出为 named export\n- 参考 src/middleware/rate-limit.ts 的代码风格\n\n### 需要创建/修改的文件\n- src/middleware/auth.ts（新建）\n- src/middleware/index.ts（添加导出）\n- src/types/express.d.ts（扩展 Request 类型，添加 user 字段）",
+
+  "contextFiles": [
+    {
+      "path": "src/middleware/rate-limit.ts",
+      "reason": "参考现有中间件的代码风格和错误处理模式"
+    },
+    {
+      "path": "src/types/express.d.ts",
+      "reason": "需要扩展 Express Request 类型"
+    },
+    {
+      "path": "package.json",
+      "reason": "确认 jsonwebtoken 依赖是否已安装"
+    },
+    {
+      "path": "src/config/env.ts",
+      "reason": "了解环境变量的读取方式"
+    }
+  ],
+
+  "constraints": [
+    "不要修改已有的测试文件",
+    "不要引入新的依赖（jsonwebtoken 和 @types/jsonwebtoken 已在 package.json 中）",
+    "错误处理风格必须与 rate-limit.ts 保持一致",
+    "不要创建 .env 文件，环境变量由部署环境提供"
+  ],
+
+  "codeReferences": [
+    {
+      "path": "src/middleware/rate-limit.ts",
+      "startLine": 15,
+      "endLine": 32,
+      "note": "参考这段的错误响应格式和 TypeScript 类型标注风格"
+    },
+    {
+      "path": "src/routes/api.ts",
+      "startLine": 8,
+      "endLine": 12,
+      "note": "这是 middleware 会被使用的地方，注意路由结构"
+    }
+  ]
+}
+```
+
+#### Prompt 注入到 Worker Session
+
+```typescript
+// Forge 收到 PM 的 assign_task 后：
+async function spawnWorker(task: SubTask, worktree: string) {
+  const { prompt } = task
+
+  if (workerType === 'openclaw') {
+    // OpenClaw 子会话：直接通过 Gateway API 创建带完整 prompt 的 session
+    const session = await gateway.createSession({
+      name: `forge-worker-${task.id}`,
+      systemPrompt: prompt.systemPrompt,
+      workspace: worktree,
+      tools: ['bash', 'file-edit', 'glob', 'grep'],
+    })
+    // 发送 PM 构造的任务消息
+    await gateway.sendMessage(session.id, buildWorkerMessage(prompt))
+
+  } else if (workerType === 'cli') {
+    // CLI agent（claude/codex）：通过 --system-prompt 和 stdin 传递
+    const proc = spawn(command, [
+      '--system-prompt', prompt.systemPrompt,
+      '--print',
+      '--dangerously-skip-permissions',
+    ], { cwd: worktree })
+    proc.stdin.write(buildWorkerMessage(prompt))
+    proc.stdin.end()
+  }
+}
+
+// 将 AgentPrompt 组装成发给 worker 的完整消息
+function buildWorkerMessage(prompt: AgentPrompt): string {
+  let message = prompt.taskMessage + '\n\n'
+
+  if (prompt.contextFiles.length > 0) {
+    message += '## 需要关注的文件\n'
+    for (const f of prompt.contextFiles) {
+      message += `- \`${f.path}\` — ${f.reason}\n`
+    }
+    message += '\n'
+  }
+
+  if (prompt.codeReferences.length > 0) {
+    message += '## 参考代码\n'
+    for (const ref of prompt.codeReferences) {
+      message += `- \`${ref.path}:${ref.startLine}-${ref.endLine}\` — ${ref.note}\n`
+    }
+    message += '\n'
+  }
+
+  if (prompt.constraints.length > 0) {
+    message += '## 约束\n'
+    for (const c of prompt.constraints) {
+      message += `- ${c}\n`
+    }
+  }
+
+  return message
+}
+```
+
+#### PM 重试时重写 Prompt
+
+验收失败后，PM 不是简单地重发原 prompt，而是基于失败原因重写：
+
+```json
+{
+  "taskMessage": "## 任务：修复 JWT 中间件（重试 1/3）\n\n上一次实现存在以下问题：\n1. 过期 token 返回的错误码是 'invalid_token' 而非 'token_expired'\n2. 缺少对 token 格式的基本验证（非 JWT 格式的字符串会导致 jsonwebtoken 抛出意外异常）\n\n### 需要修改\n- src/middleware/auth.ts 第 23-35 行的 catch 块\n- 在验证前添加 token 格式检查\n\n### 参考上一次的错误输出\n```\nExpected error code 'token_expired' but got 'invalid_token'\nTypeError: Cannot read property 'split' of undefined\n```\n\n其余要求不变，请参考原始任务描述。",
+
+  "constraints": [
+    "重点修复上述两个问题",
+    "不要重写整个文件，只修改需要修复的部分",
+    "修改后请自行运行 npm test 确认测试通过"
+  ]
 }
 ```
 
